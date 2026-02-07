@@ -4,9 +4,18 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import TYPE_CHECKING
 
 from hvym_pinner.api.mode import DaemonModeController
 from hvym_pinner.models.config import DaemonMode
+from hvym_pinner.models.hunter import (
+    CycleReport,
+    FlagRecord,
+    HunterSummary,
+    TrackedPin,
+    TrackedPinSnapshot,
+    VerificationResult,
+)
 from hvym_pinner.models.records import ActionResult
 from hvym_pinner.models.snapshots import (
     ActivityEntry,
@@ -19,6 +28,9 @@ from hvym_pinner.models.snapshots import (
 from hvym_pinner.stellar.queries import ContractQueries, STROOPS_PER_XLM
 from hvym_pinner.policy.filter import ESTIMATED_TX_FEE
 from hvym_pinner.storage.sqlite import SQLiteStateStore
+
+if TYPE_CHECKING:
+    from hvym_pinner.hunter.orchestrator import CIDHunterOrchestrator
 
 log = logging.getLogger(__name__)
 
@@ -60,12 +72,14 @@ class DataAggregator:
         mode_ctrl: DaemonModeController,
         our_address: str,
         start_time: float | None = None,
+        hunter: CIDHunterOrchestrator | None = None,
     ) -> None:
         self._store = store
         self._queries = queries
         self._mode_ctrl = mode_ctrl
         self._our_address = our_address
         self._start_time = start_time or time.monotonic()
+        self._hunter = hunter
 
     # ── Snapshots ──────────────────────────────────────────
 
@@ -81,6 +95,11 @@ class DataAggregator:
         activity = await self._store.get_recent_activity(20)
         queue = await self._store.get_approval_queue()
         earnings_data = await self._store.get_earnings()
+
+        # CID Hunter summary (if enabled)
+        hunter_summary = None
+        if self._hunter:
+            hunter_summary = await self._hunter.get_hunter_summary()
 
         return DashboardSnapshot(
             mode=self._mode_ctrl.get_mode().value,
@@ -111,6 +130,7 @@ class DataAggregator:
                 )
                 for a in activity
             ],
+            hunter=hunter_summary,
         )
 
     async def get_offers(self, status: str | None = None) -> list[OfferSnapshot]:
@@ -223,3 +243,56 @@ class DataAggregator:
         msg = f"Policy updated: {', '.join(parts)}"
         await self._store.log_activity("policy_updated", msg)
         return ActionResult(success=True, message=msg)
+
+    # ── Hunter Data API ────────────────────────────────────
+
+    async def get_hunter_summary(self) -> HunterSummary | None:
+        if not self._hunter:
+            return None
+        return await self._hunter.get_hunter_summary()
+
+    async def get_tracked_pins(self) -> list[TrackedPinSnapshot]:
+        if not self._hunter:
+            return []
+        pins = await self._hunter.get_tracked_pins()
+        return [self._pin_to_snapshot(p) for p in pins]
+
+    async def get_suspects(self) -> list[TrackedPinSnapshot]:
+        if not self._hunter:
+            return []
+        pins = await self._hunter.get_suspects()
+        return [self._pin_to_snapshot(p) for p in pins]
+
+    async def get_flag_history(self) -> list[FlagRecord]:
+        if not self._hunter:
+            return []
+        return await self._hunter.get_flag_history()
+
+    async def get_cycle_history(self, limit: int = 10) -> list[CycleReport]:
+        if not self._hunter:
+            return []
+        return await self._hunter.get_cycle_history(limit)
+
+    async def hunter_verify_now(
+        self, cid: str | None = None, pinner_address: str | None = None
+    ) -> list[VerificationResult]:
+        if not self._hunter:
+            return []
+        return await self._hunter.verify_now(cid, pinner_address)
+
+    def _pin_to_snapshot(self, pin: TrackedPin) -> TrackedPinSnapshot:
+        return TrackedPinSnapshot(
+            cid=pin.cid,
+            cid_short=pin.cid[:16],
+            pinner_address=pin.pinner_address,
+            pinner_address_short=pin.pinner_address[:8],
+            pinner_node_id=pin.pinner_node_id,
+            status=pin.status,
+            consecutive_failures=pin.consecutive_failures,
+            failure_threshold=3,  # Default; could come from config
+            total_checks=pin.total_checks,
+            total_failures=pin.total_failures,
+            last_verified_at=pin.last_verified_at,
+            last_checked_at=pin.last_checked_at,
+            flagged_at=pin.flagged_at,
+        )

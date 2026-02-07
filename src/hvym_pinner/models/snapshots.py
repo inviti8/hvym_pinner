@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
+from hvym_pinner.models.hunter import HunterSummary
+
 
 def _to_dict(obj: Any) -> dict:
     """Recursively convert a dataclass to a plain dict."""
@@ -169,7 +171,7 @@ class DashboardSnapshot:
     contract: ContractSnapshot | None = None
 
     # CID Hunter (None if disabled)
-    hunter: Any = None  # HunterSummary, typed in hunter module
+    hunter: HunterSummary | None = None
 
     def to_dict(self) -> dict:
         return _to_dict(self)

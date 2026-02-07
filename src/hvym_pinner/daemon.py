@@ -11,6 +11,7 @@ from stellar_sdk import Keypair
 
 from hvym_pinner.api.data_api import DataAggregator
 from hvym_pinner.api.mode import DaemonModeController
+from hvym_pinner.hunter.orchestrator import CIDHunterOrchestrator
 from hvym_pinner.ipfs.executor import KuboPinExecutor
 from hvym_pinner.models.config import DaemonConfig, DaemonMode
 from hvym_pinner.models.events import PinEvent, PinnedEvent, UnpinEvent
@@ -58,8 +59,27 @@ class PinnerDaemon:
             cfg.contract_id, cfg.rpc_url, passphrase, keypair,
         )
         self.mode_ctrl = DaemonModeController(self.store, cfg.mode)
+        self.data_api: DataAggregator = None  # type: ignore[assignment]  # set after hunter init
+
+        # CID Hunter (optional - disabled by default)
+        self.hunter: CIDHunterOrchestrator | None = None
+        if cfg.hunter.enabled:
+            self.hunter = CIDHunterOrchestrator(
+                store=self.store,
+                queries=self.queries,
+                config=cfg.hunter,
+                our_address=public_key,
+                contract_id=cfg.contract_id,
+                rpc_url=cfg.rpc_url,
+                network_passphrase=passphrase,
+                keypair=keypair,
+                kubo_rpc_url=cfg.kubo_rpc_url,
+            )
+
+        # Data API (needs hunter ref, so built after hunter init)
         self.data_api = DataAggregator(
             self.store, self.queries, self.mode_ctrl, public_key, self._start_time,
+            hunter=self.hunter,
         )
 
         self._public_key = public_key
@@ -94,9 +114,15 @@ class PinnerDaemon:
         self._running = True
         await self.store.log_activity("daemon_started", "Daemon started")
 
+        # Start CID Hunter if enabled
+        if self.hunter:
+            await self.hunter.start()
+
         try:
             await self._main_loop()
         finally:
+            if self.hunter:
+                await self.hunter.stop()
             await self.store.log_activity("daemon_stopped", "Daemon stopped")
             await self.store.close()
             log.info("Daemon shut down cleanly")
@@ -180,6 +206,10 @@ class PinnerDaemon:
             )
             return
 
+        # Forward to CID Hunter for tracking
+        if self.hunter:
+            await self.hunter.on_pin_event(event)
+
         # Mode branch
         mode = self.mode_ctrl.get_mode()
         if mode == DaemonMode.APPROVE:
@@ -209,6 +239,10 @@ class PinnerDaemon:
             amount=event.amount,
         )
 
+        # Forward to CID Hunter for pinner tracking
+        if self.hunter:
+            await self.hunter.on_pinned_event(event)
+
         # Update our offer record if we have one
         offer = await self.store.get_offer(event.slot_id)
         if offer and event.pins_remaining <= 0:
@@ -217,6 +251,11 @@ class PinnerDaemon:
     async def _handle_unpin_event(self, event: UnpinEvent) -> None:
         """Process an UNPIN event (slot freed)."""
         log.info("UNPIN event: slot=%d", event.slot_id)
+
+        # Forward to CID Hunter to stop tracking freed slots
+        if self.hunter:
+            await self.hunter.on_unpin_event(event)
+
         await self.store.update_offer_status(event.slot_id, "expired")
         await self.store.log_activity(
             "offer_expired",

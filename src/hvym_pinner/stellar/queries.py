@@ -75,6 +75,13 @@ class ContractQueries:
         )
         self._rpc_url = rpc_url
 
+    async def close(self) -> None:
+        """Close the underlying aiohttp session."""
+        try:
+            await self._client.server.close()
+        except Exception:
+            pass
+
     async def get_slot(self, slot_id: int) -> SlotInfo | None:
         """Query a slot's current on-chain state."""
         try:
@@ -129,6 +136,26 @@ class ContractQueries:
             return tx.result()
         except Exception as exc:
             log.warning("is_slot_expired(%d) failed: %s", slot_id, exc)
+            return None
+
+    async def get_join_fee(self) -> int | None:
+        """Get the join fee for pinners (in stroops)."""
+        try:
+            tx = await self._client.join_fee()
+            await tx.simulate()
+            return tx.result()
+        except Exception as exc:
+            log.warning("get_join_fee failed: %s", exc)
+            return None
+
+    async def get_pinner_stake(self) -> int | None:
+        """Get the required pinner stake (in stroops)."""
+        try:
+            tx = await self._client.pinner_stake_amount()
+            await tx.simulate()
+            return tx.result()
+        except Exception as exc:
+            log.warning("get_pinner_stake failed: %s", exc)
             return None
 
     async def get_wallet_balance(self, address: str) -> int:

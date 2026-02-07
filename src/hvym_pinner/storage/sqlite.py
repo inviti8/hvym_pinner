@@ -426,6 +426,14 @@ class SQLiteStateStore:
         )
         await self.db.commit()
 
+    async def get_tracked_cid_by_slot(self, slot_id: int) -> str | None:
+        """Look up a tracked CID by slot ID."""
+        async with self.db.execute(
+            "SELECT cid FROM tracked_cids WHERE slot_id=?", (slot_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row["cid"] if row else None
+
     async def save_tracked_pin(self, pin: TrackedPin) -> None:
         now = _now()
         await self.db.execute(
