@@ -29,4 +29,7 @@ state.db
 .DS_Store
 Thumbs.db
 
+# Test reports
+reports/
+
 .claude/

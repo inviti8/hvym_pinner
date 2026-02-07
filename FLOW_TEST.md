@@ -8,7 +8,7 @@ Define a comprehensive test plan for the `hvym_pinner` daemon covering the full 
 
 ### What's Tested
 
-- **Core flow**: PIN event → policy filter → Kubo pin → Soroban claim → state persistence
+- **Core flow**: PIN event → policy filter → gateway fetch → Kubo add → CID verify → local pin → Soroban claim → state persistence
 - **Rejection paths**: Price, balance, slot state, profitability filters
 - **Error recovery**: Pin timeouts, claim failures (AlreadyClaimed, SlotExpired, NotPinner)
 - **Event lifecycle**: PIN → PINNED → UNPIN state transitions
@@ -75,33 +75,35 @@ Requires a running Kubo daemon at `localhost:5001`. Tests real IPFS pinning with
 
 The daemon pins content by CID. Tests need real CIDs that correspond to actual content — but we don't need real publisher data or gateways.
 
-### How It Works
+### How It Works (Gateway-Fetch Architecture)
 
-1. **Add test files to local Kubo** via `POST /api/v0/add`:
-   ```
-   POST http://127.0.0.1:5001/api/v0/add
-   Content-Type: multipart/form-data
-   file=<test content bytes>
-   ```
-   Returns: `{"Hash": "QmXyz...", "Size": "42"}`
+Pintheon IPFS nodes run **fully private swarms** (private swarm key, `LIBP2P_FORCE_PNET=1`, all bootstrap peers removed). Content is not discoverable via DHT. The executor uses a gateway-fetch-first pipeline:
 
-2. **Use the returned CID** in synthetic `PinEvent` objects.
+1. **Fetch content from the publisher's HTTPS gateway**: `GET {gateway}/ipfs/{cid}`
+2. **Add to local Kubo** via `POST /api/v0/add` with Pintheon-matching params
+3. **Verify CID**: Compare the returned `Hash` against expected CID (mismatch = failure)
+4. **Pin locally**: `POST /api/v0/pin/add?arg={cid}` (instant since blocks are now local)
 
-3. **Test files**: Small deterministic payloads:
-   - `b"hvym-pinner-test-alpha"` → consistent CID across runs
-   - `b"hvym-pinner-test-beta"` → second CID for multi-pin scenarios
-   - `b"\x00" * 1024` → 1KB binary blob for size checks
+This means the **gateway URL is critical** — it's the only way to obtain content.
 
-### Why the Gateway Field Doesn't Matter
+### Surrogate Content for Tests
 
-`KuboPinExecutor.pin()` calls:
-```
-POST /api/v0/pin/add?arg={cid}&progress=false
-```
+**Tier 1 (mock-only)**: The executor is mocked entirely. No gateway or Kubo calls happen. Surrogate CIDs and gateway URLs are arbitrary strings.
 
-Kubo resolves the CID via DHT, **not** via the gateway URL. The `gateway` field from `PinEvent` is only logged — it never affects pin resolution. For Tier 2 tests the content is already local (we just added it), so `pin/add` finds it instantly.
+**Tier 2 (real Kubo)**: Tests need a real HTTP server serving content at a gateway URL, plus a local Kubo daemon to receive it. The approach:
 
-For Tier 1 tests, the executor is mocked entirely — the gateway field is irrelevant.
+1. **Pre-compute CIDs**: Add test payloads to Kubo via `POST /api/v0/add` to discover their CIDs, then **unpin** them so the executor must go through the full pipeline.
+2. **Serve content via a local HTTP test server** (`pytest-httpserver` or `aiohttp.web`): Mount content at `/ipfs/{cid}` so the executor's gateway fetch succeeds.
+3. **Use the local server URL** as the `gateway` field in synthetic `PinEvent` objects.
+
+**Test files**: Small deterministic payloads:
+- `b"hvym-pinner-test-alpha"` → consistent CID across runs
+- `b"hvym-pinner-test-beta"` → second CID for multi-pin scenarios
+- `b"\x00" * 1024` → 1KB binary blob for size checks
+
+### CID Mismatch Testing
+
+To test the CID verification step, Tier 2 fixtures can serve **wrong content** at a given CID path. The executor will add the wrong bytes to Kubo, get back a different hash, and return `PinResult(success=False, error="cid_mismatch: ...")`.
 
 ### Cleanup
 
@@ -116,7 +118,8 @@ Tier 2 test fixtures unpin all surrogate CIDs in teardown via `POST /api/v0/pin/
 | 1 | **Soroban RPC** | JSON-RPC over HTTPS | `SorobanEventPoller` | `getEvents`, `getLatestLedger` | Mock at `SorobanServer` level — replace `poller` attribute on daemon |
 | 2 | **Soroban Transactions** | JSON-RPC over HTTPS | `SorobanClaimSubmitter`, `SorobanFlagSubmitter`, `ContractQueries` | `simulateTransaction`, `sendTransaction`, contract simulations | Mock at component level — replace `submitter`/`queries` attributes |
 | 3 | **Horizon API** | REST over HTTPS | `ContractQueries.get_wallet_balance()` | `GET /accounts/{addr}` | Mocked inside `ContractQueries` mock (returns int balance) |
-| 4 | **Kubo IPFS RPC** | HTTP POST | `KuboPinExecutor`, `KuboPinVerifier` | `pin/add`, `pin/ls`, `pin/rm`, `object/stat`, `routing/findprovs`, `swarm/connect`, `block/get`, `cat` | **Tier 1**: Mock entire executor/verifier. **Tier 2**: Real calls to local Kubo |
+| 4 | **Kubo IPFS RPC** | HTTP POST | `KuboPinExecutor`, `KuboPinVerifier` | `add`, `pin/add`, `pin/ls`, `pin/rm`, `object/stat`, `routing/findprovs`, `swarm/connect`, `block/get`, `cat` | **Tier 1**: Mock entire executor/verifier. **Tier 2**: Real calls to local Kubo |
+| 5 | **Publisher HTTPS Gateway** | HTTPS GET | `KuboPinExecutor.pin()` | `GET {gateway}/ipfs/{cid}` (streaming fetch) | **Tier 1**: Mock entire executor. **Tier 2**: Local HTTP server fixture serves surrogate content at gateway URL |
 
 ---
 
@@ -130,6 +133,7 @@ Located in `tests/factories.py`:
 def make_pin_event(
     slot_id: int = 1,
     cid: str = "QmTestCID123",
+    filename: str = "test-asset.glb",
     gateway: str = "https://ipfs.example.com",
     offer_price: int = 1_000_000,      # 0.1 XLM
     pin_qty: int = 3,
@@ -318,8 +322,8 @@ def make_test_config(**overrides) -> DaemonConfig:
 
 | # | Test Name | Description | Tier |
 |---|-----------|-------------|------|
-| 1 | `test_auto_mode_full_lifecycle` | PIN event arrives → filter accepts → executor pins → submitter claims → offer status transitions: `pending` → `pinning` → `claiming` → `claimed`. Verify: `store.get_offers_by_status("claimed")` returns 1 record, `store.get_earnings()` reflects correct amount, activity log contains `offer_seen`, `pin_started`, `pin_success`, `claim_success` entries. | T1 |
-| 2 | `test_auto_mode_with_real_kubo` | Same flow but with real `KuboPinExecutor` pinning surrogate content. Verify the CID is actually pinned via `pin/ls`. | T2 |
+| 1 | `test_auto_mode_full_lifecycle` | PIN event arrives → filter accepts → executor pins (gateway fetch → add → verify → pin) → submitter claims → offer status transitions: `pending` → `pinning` → `claiming` → `claimed`. Verify: `store.get_offers_by_status("claimed")` returns 1 record with correct `filename`, `store.get_earnings()` reflects correct amount, activity log contains `offer_seen`, `pin_started`, `pin_success`, `claim_success` entries. | T1 |
+| 2 | `test_auto_mode_with_real_kubo` | Same flow but with real `KuboPinExecutor` and local test HTTP server as gateway. Surrogate content served at `{gateway}/ipfs/{cid}`. Verify the CID is actually pinned via `pin/ls` and the gateway-fetch → add → CID verify → pin pipeline completes end-to-end. | T2 |
 
 **Test approach**: Call `daemon._handle_pin_event(event)` directly. This is deterministic (no polling loop, no sleep).
 
@@ -339,12 +343,16 @@ def make_test_config(**overrides) -> DaemonConfig:
 
 | # | Test Name | Description | Tier |
 |---|-----------|-------------|------|
-| 8 | `test_error_pin_timeout` | `MockExecutor` returns `PinResult(success=False, error="timeout")`. Verify: status → `pin_failed`, activity log contains error, claim never attempted. | T1 |
+| 8 | `test_error_pin_timeout` | `MockExecutor` returns `PinResult(success=False, error="gateway timeout after 3 attempts")`. Verify: status → `pin_failed`, activity log contains error, claim never attempted. | T1 |
 | 9 | `test_error_claim_already_claimed` | Pin succeeds, `MockSubmitter` returns `ClaimResult(success=False, error="already_claimed")`. Verify: pin saved, status → `claim_failed`, no earnings recorded. | T1 |
 | 10 | `test_error_claim_slot_expired` | Same pattern with `error="slot_expired"`. | T1 |
 | 11 | `test_error_claim_not_pinner` | Same pattern with `error="not_pinner"`. | T1 |
+| 24 | `test_error_gateway_http_error` | Real executor with local test server returning HTTP 404 for the CID path. Verify: `PinResult(success=False, error="gateway HTTP 404")`, status → `pin_failed`. | T2 |
+| 25 | `test_error_cid_mismatch` | Real executor with local test server serving **wrong content** at the CID path. Kubo `add` returns a different hash. Verify: `PinResult(success=False, error="cid_mismatch: ...")`, content is NOT pinned. | T2 |
+| 26 | `test_error_content_too_large` | Real executor (or mock) with `Content-Length` exceeding `max_content_size`. Verify: `PinResult(success=False, error="content too large: ...")`, download aborted before full body read. | T2 |
+| 27 | `test_error_gateway_timeout_retries` | Real executor with local test server that delays response beyond `pin_timeout`. Verify: retries up to `fetch_retries`, then returns `PinResult(success=False, error="gateway timeout ...")`. | T2 |
 
-**Test approach**: Call `daemon._handle_pin_event(event)` with error-producing mocks.
+**Test approach**: Tests 8-11 call `daemon._handle_pin_event(event)` with error-producing mocks. Tests 24-27 use the real `KuboPinExecutor` with a local test HTTP server fixture that returns controlled responses.
 
 ### 6.4 Event Lifecycle (State Transitions)
 
@@ -376,7 +384,17 @@ def make_test_config(**overrides) -> DaemonConfig:
 
 **Test approach**: For test 19, wire `CIDHunterOrchestrator` with mock verifier/flag submitter, call event handlers, then `scheduler.run_cycle()` three times. For test 20, process events in sequence and verify state.
 
-### 6.7 Concurrent Events, Persistence, Data API
+### 6.7 Filename Threading
+
+| # | Test Name | Description | Tier |
+|---|-----------|-------------|------|
+| 28 | `test_filename_persisted_in_offer` | PIN event with `filename="scene.glb"` → `store.save_offer()` → `store.get_offer()` returns `OfferRecord` with `filename="scene.glb"`. | T1 |
+| 29 | `test_filename_in_offer_snapshot` | PIN event with filename → offer saved → `data_api.get_offers()` returns `OfferSnapshot` with correct `filename`. | T1 |
+| 30 | `test_filename_in_approved_offer_reconstruction` | Mode=APPROVE → PIN event with `filename="model.glb"` queued → approved → daemon reconstructs `PinEvent` from `OfferRecord` → executor receives correct `cid` and `gateway`. Verify the reconstructed `PinEvent` has `filename="model.glb"`. | T1 |
+
+**Test approach**: Use real `SQLiteStateStore(:memory:)` and real `DataAggregator`. Call `daemon._handle_pin_event()` then query store/API.
+
+### 6.8 Concurrent Events, Persistence, Data API
 
 | # | Test Name | Description | Tier |
 |---|-----------|-------------|------|
@@ -458,10 +476,11 @@ async def daemon(test_config, store, mock_poller, mock_executor,
     return d
 ```
 
-### 7.2 Kubo-Specific Fixtures (`tests/conftest.py`)
+### 7.2 Kubo & Gateway Fixtures (`tests/conftest.py`)
 
 ```python
 import httpx
+from aiohttp import web
 
 
 @pytest.fixture(scope="session")
@@ -475,20 +494,58 @@ def kubo_available():
 
 
 @pytest.fixture
-async def surrogate_cid(kubo_available):
-    """Add surrogate content to Kubo and return CID. Cleans up after test."""
+async def surrogate_content(kubo_available):
+    """Add surrogate content to Kubo, discover CID, then unpin.
+
+    Returns (cid, content_bytes). Content is NOT pinned — the executor
+    must go through the full gateway-fetch → add → pin pipeline.
+    """
+    content = b"hvym-pinner-test-alpha"
     async with httpx.AsyncClient() as client:
+        # Add to discover CID
         resp = await client.post(
             "http://127.0.0.1:5001/api/v0/add",
-            files={"file": ("test.txt", b"hvym-pinner-test-alpha")},
+            files={"file": ("test.txt", content)},
         )
         cid = resp.json()["Hash"]
-        yield cid
-        # Teardown: unpin
+        # Unpin so it's not already pinned
         await client.post(
             "http://127.0.0.1:5001/api/v0/pin/rm",
             params={"arg": cid},
         )
+        yield cid, content
+        # Teardown: clean up pin if test succeeded
+        await client.post(
+            "http://127.0.0.1:5001/api/v0/pin/rm",
+            params={"arg": cid},
+        )
+
+
+@pytest.fixture
+async def gateway_server(surrogate_content):
+    """Local HTTP server that serves surrogate content at /ipfs/{cid}.
+
+    Returns the base URL (e.g. "http://127.0.0.1:9199").
+    The executor will fetch from {base_url}/ipfs/{cid}.
+    """
+    cid, content = surrogate_content
+    content_map = {cid: content}
+
+    async def handle_ipfs(request):
+        req_cid = request.match_info["cid"]
+        if req_cid in content_map:
+            return web.Response(body=content_map[req_cid])
+        return web.Response(status=404)
+
+    app = web.Application()
+    app.router.add_get("/ipfs/{cid}", handle_ipfs)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 9199)
+    await site.start()
+    yield "http://127.0.0.1:9199", content_map
+    await runner.cleanup()
 
 
 @pytest.fixture
@@ -500,6 +557,21 @@ async def real_executor(kubo_available, test_config):
         max_content_size=test_config.max_content_size,
         fetch_retries=test_config.fetch_retries,
     )
+```
+
+**Tier 2 test pattern** for gateway-fetch tests:
+
+```python
+@pytest.mark.kubo
+async def test_auto_mode_with_real_kubo(real_executor, surrogate_content, gateway_server):
+    cid, content = surrogate_content
+    gateway_url, _ = gateway_server
+
+    result = await real_executor.pin(cid, gateway_url)
+
+    assert result.success
+    assert result.cid == cid
+    assert await real_executor.verify_pinned(cid)
 ```
 
 ### 7.3 Hunter Fixtures
@@ -573,10 +645,13 @@ tests/
 ├── test_approve_mode.py     # Tests 15-18: approval workflow + mode switch
 ├── test_hunter.py           # Tests 19-20: CID Hunter track/verify/flag
 ├── test_integration.py      # Tests 21-23: concurrent, persistence, dashboard
+├── test_filename.py         # Tests 28-30: filename threading through stack
 │
 └── tier2/
     ├── __init__.py
-    └── test_kubo_pin.py     # Test 2: real Kubo pinning (marked @pytest.mark.kubo)
+    ├── conftest.py           # Gateway server fixture, surrogate content
+    ├── test_kubo_pin.py      # Test 2: real Kubo pinning via gateway-fetch pipeline
+    └── test_gateway_errors.py # Tests 24-27: gateway HTTP errors, CID mismatch, size limit, timeouts
 ```
 
 ---
@@ -587,10 +662,10 @@ tests/
 
 - Python 3.11+
 - Project dependencies: `uv sync` (installs `stellar-sdk[aiohttp]`, `httpx`, `aiosqlite`)
-- Test dependencies: `pytest`, `pytest-asyncio`, `pytest-mock`
+- Test dependencies: `pytest`, `pytest-asyncio`, `pytest-mock`, `pytest-html`
 - **No external services required**
 
-Run: `uv run pytest` (or `uv run pytest -m "not kubo"` to be explicit)
+Run: `uv run pytest` (or `uv run pytest -m "not kubo"` to be explicit) → generates `reports/test-report.html`
 
 ### Tier 2 (Local Development)
 
@@ -598,8 +673,9 @@ Run: `uv run pytest` (or `uv run pytest -m "not kubo"` to be explicit)
 - **Kubo daemon** running at `localhost:5001` (default config)
   - Install: `ipfs init && ipfs daemon`
   - Or Docker: `docker run -d -p 5001:5001 ipfs/kubo:latest`
+- **`aiohttp`** (already a transitive dependency via `stellar-sdk[aiohttp]`) used to run the local gateway test server fixture
 
-Run: `uv run pytest -m kubo`
+Run: `uv run pytest -m kubo` → generates `reports/test-report.html`
 
 ### Pytest Configuration (`pyproject.toml` additions)
 
@@ -607,6 +683,7 @@ Run: `uv run pytest -m kubo`
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+addopts = "--html=reports/test-report.html --self-contained-html -v"
 markers = [
     "kubo: requires local Kubo daemon at localhost:5001",
     "tier1: mock-only fast tests (default)",
@@ -643,3 +720,23 @@ The test config uses a real testnet keypair. This is safe because:
 1. All Stellar network calls are mocked in Tier 1
 2. The keypair has no mainnet funds
 3. The secret is already in the repo's `.env` (gitignored) and deployed contracts doc
+
+---
+
+## 11. Test Reports
+
+### HTML Report
+
+Every `pytest` run auto-generates a self-contained HTML report at `reports/test-report.html` (configured via `addopts` in `pyproject.toml`). The `--self-contained-html` flag embeds all CSS and assets into a single file — no external dependencies.
+
+### Console Output
+
+The `-v` flag in `addopts` shows per-test pass/fail status in the terminal for quick feedback during development.
+
+### CI Integration
+
+The `reports/` directory can be uploaded as a build artifact in CI pipelines (e.g. GitHub Actions `actions/upload-artifact`). Each run produces a fresh report that reviewers can download and open in a browser.
+
+### `.gitignore`
+
+The `reports/` directory should be added to `.gitignore` — reports are ephemeral build outputs, not source-controlled artifacts.
