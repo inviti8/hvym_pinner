@@ -1,0 +1,36 @@
+[daemon]
+mode = "auto"              # "auto" (fully autonomous) or "approve" (semi-autonomous)
+poll_interval = 5          # seconds between event polls
+error_backoff = 30         # seconds to wait after an error
+log_level = "info"
+
+[stellar]
+network = "testnet"
+rpc_url = "https://soroban-testnet.stellar.org"
+# Contract IDs loaded from deployments.json by default; override here if needed:
+# contract_id = "CCEDYFIHUCJFITWEOT7BWUO2HBQQ72L244ZXQ4YNOC6FYRDN3MKDQFK7"
+deployments_path = "../pintheon_contracts/deployments.json"
+# Secret key: use HVYM_PINNER_SECRET env var instead of putting it here
+# keypair_secret = ""
+
+[ipfs]
+kubo_rpc_url = "http://127.0.0.1:5001"
+pin_timeout = 60           # seconds
+max_content_size = 1073741824  # 1 GB
+fetch_retries = 3
+
+[policy]
+min_price = 100            # minimum stroops per pin to accept
+
+[storage]
+db_path = "~/.hvym_pinner/state.db"
+
+[hunter]
+enabled = false
+cycle_interval = 3600      # seconds between verification cycles (1 hour)
+check_timeout = 30         # seconds per individual pinner check
+max_concurrent_checks = 5
+failure_threshold = 3      # consecutive failures before auto-flagging
+cooldown_after_flag = 86400  # 24 hours
+pinner_cache_ttl = 3600
+verification_methods = ["dht_provider", "bitswap"]
