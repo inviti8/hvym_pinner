@@ -74,6 +74,7 @@ def _parse_event(info: EventInfo) -> ContractEvent | None:
             return PinEvent(
                 slot_id=raw.slot_id,
                 cid=raw.cid.decode("utf-8") if isinstance(raw.cid, bytes) else str(raw.cid),
+                filename=raw.filename.decode("utf-8") if isinstance(raw.filename, bytes) else str(raw.filename),
                 gateway=raw.gateway.decode("utf-8") if isinstance(raw.gateway, bytes) else str(raw.gateway),
                 offer_price=raw.offer_price,
                 pin_qty=raw.pin_qty,

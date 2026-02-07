@@ -46,6 +46,7 @@ def _offer_to_snapshot(offer) -> OfferSnapshot:
     return OfferSnapshot(
         slot_id=offer.slot_id,
         cid=offer.cid,
+        filename=offer.filename,
         gateway=offer.gateway,
         offer_price=offer.offer_price,
         offer_price_xlm=_xlm_str(offer.offer_price),

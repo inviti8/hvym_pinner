@@ -46,6 +46,7 @@ class OfferRecord:
 
     slot_id: int
     cid: str
+    filename: str
     gateway: str
     offer_price: int
     pin_qty: int

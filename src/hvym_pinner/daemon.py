@@ -153,6 +153,7 @@ class PinnerDaemon:
                     pin_event = PinEvent(
                         slot_id=offer.slot_id,
                         cid=offer.cid,
+                        filename=offer.filename,
                         gateway=offer.gateway,
                         offer_price=offer.offer_price,
                         pin_qty=offer.pin_qty,

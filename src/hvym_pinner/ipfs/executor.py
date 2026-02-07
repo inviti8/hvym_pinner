@@ -37,84 +37,162 @@ class KuboPinExecutor:
         return f"{self._base_url}/api/v0/{endpoint}"
 
     async def pin(self, cid: str, gateway: str) -> PinResult:
-        """Pin a CID to the local Kubo node.
+        """Pin a CID to the local Kubo node via gateway-fetch pipeline.
 
-        Uses pin/add which fetches the content from the IPFS network.
-        The gateway hint is logged but Kubo resolves via its own DHT.
+        Pintheon nodes run private IPFS swarms, so DHT resolution won't work
+        for fresh content. Instead we:
+        1. Fetch content bytes from the publisher's HTTPS gateway
+        2. Add to local Kubo via /api/v0/add (with matching chunker params)
+        3. Verify the returned CID matches the expected CID
+        4. Pin locally (instant since blocks are already present)
         """
-        log.info("Pinning CID %s (gateway hint: %s)", cid, gateway)
+        log.info("Pinning CID %s via gateway %s", cid, gateway)
         start = time.monotonic()
+
+        # Step 1: Fetch content from the publisher's gateway
+        gateway_url = f"{gateway.rstrip('/')}/ipfs/{cid}"
+        content_bytes: bytes | None = None
 
         for attempt in range(1, self._fetch_retries + 1):
             try:
-                async with httpx.AsyncClient(timeout=self._pin_timeout) as client:
-                    # pin/add fetches and pins in one call
-                    resp = await client.post(
-                        self._url("pin/add"),
-                        params={"arg": cid, "progress": "false"},
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(self._pin_timeout, connect=10),
+                    follow_redirects=True,
+                ) as client:
+                    async with client.stream("GET", gateway_url) as resp:
+                        resp.raise_for_status()
 
-                    duration = int((time.monotonic() - start) * 1000)
-                    pinned_cid = data.get("Pins", [cid])[0] if "Pins" in data else cid
+                        # Check Content-Length before downloading body
+                        content_length = resp.headers.get("content-length")
+                        if content_length and int(content_length) > self._max_content_size:
+                            duration = int((time.monotonic() - start) * 1000)
+                            return PinResult(
+                                success=False,
+                                cid=cid,
+                                error=f"content too large: {content_length} bytes "
+                                      f"(max {self._max_content_size})",
+                                duration_ms=duration,
+                            )
 
-                    # Get object size
-                    bytes_pinned = await self._get_object_size(cid)
+                        # Read body bytes
+                        chunks = []
+                        total = 0
+                        async for chunk in resp.aiter_bytes():
+                            total += len(chunk)
+                            if total > self._max_content_size:
+                                duration = int((time.monotonic() - start) * 1000)
+                                return PinResult(
+                                    success=False,
+                                    cid=cid,
+                                    error=f"content exceeded max size during download "
+                                          f"(>{self._max_content_size} bytes)",
+                                    duration_ms=duration,
+                                )
+                            chunks.append(chunk)
+                        content_bytes = b"".join(chunks)
 
-                    log.info(
-                        "Pinned %s (%s bytes) in %dms",
-                        pinned_cid,
-                        bytes_pinned or "?",
-                        duration,
-                    )
-                    return PinResult(
-                        success=True,
-                        cid=pinned_cid,
-                        bytes_pinned=bytes_pinned,
-                        duration_ms=duration,
-                    )
+                log.info(
+                    "Fetched %d bytes from gateway (attempt %d)", len(content_bytes), attempt,
+                )
+                break  # Success
 
-            except httpx.TimeoutException:
-                duration = int((time.monotonic() - start) * 1000)
-                if attempt < self._fetch_retries:
+            except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+                retryable = isinstance(exc, httpx.TimeoutException) or (
+                    isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500
+                )
+                if retryable and attempt < self._fetch_retries:
                     log.warning(
-                        "Pin timeout for %s (attempt %d/%d)",
-                        cid,
-                        attempt,
-                        self._fetch_retries,
+                        "Gateway fetch failed for %s (attempt %d/%d): %s",
+                        cid, attempt, self._fetch_retries, exc,
                     )
                     continue
-                return PinResult(
-                    success=False,
-                    cid=cid,
-                    error=f"timeout after {self._fetch_retries} attempts",
-                    duration_ms=duration,
-                )
-
-            except httpx.HTTPStatusError as exc:
                 duration = int((time.monotonic() - start) * 1000)
-                error_msg = f"HTTP {exc.response.status_code}: {exc.response.text[:200]}"
-                log.error("Pin failed for %s: %s", cid, error_msg)
+                error_msg = str(exc)
+                if isinstance(exc, httpx.HTTPStatusError):
+                    error_msg = f"gateway HTTP {exc.response.status_code}"
+                else:
+                    error_msg = f"gateway timeout after {self._fetch_retries} attempts"
+                log.error("Gateway fetch failed for %s: %s", cid, error_msg)
                 return PinResult(
-                    success=False,
-                    cid=cid,
-                    error=error_msg,
-                    duration_ms=duration,
+                    success=False, cid=cid, error=error_msg, duration_ms=duration,
                 )
 
             except Exception as exc:
                 duration = int((time.monotonic() - start) * 1000)
-                log.error("Pin error for %s: %s", cid, exc)
+                log.error("Gateway fetch error for %s: %s", cid, exc)
                 return PinResult(
-                    success=False,
-                    cid=cid,
-                    error=str(exc),
-                    duration_ms=duration,
+                    success=False, cid=cid, error=str(exc), duration_ms=duration,
                 )
 
-        # Should not reach here, but just in case
-        return PinResult(success=False, cid=cid, error="max retries exceeded")
+        if content_bytes is None:
+            duration = int((time.monotonic() - start) * 1000)
+            return PinResult(
+                success=False, cid=cid, error="gateway fetch failed", duration_ms=duration,
+            )
+
+        # Step 2: Add content to local Kubo via /api/v0/add
+        try:
+            async with httpx.AsyncClient(timeout=self._pin_timeout) as client:
+                resp = await client.post(
+                    self._url("add"),
+                    params={
+                        "wrap-with-directory": "false",
+                        "chunker": "size-262144",
+                        "raw-leaves": "false",
+                        "cid-version": "0",
+                        "hash": "sha2-256",
+                        "pin": "false",  # We pin explicitly in step 3
+                    },
+                    files={"file": ("data", content_bytes)},
+                )
+                resp.raise_for_status()
+                add_data = resp.json()
+        except Exception as exc:
+            duration = int((time.monotonic() - start) * 1000)
+            log.error("Kubo add failed for %s: %s", cid, exc)
+            return PinResult(
+                success=False, cid=cid, error=f"kubo_add: {exc}", duration_ms=duration,
+            )
+
+        # CID verification
+        returned_cid = add_data.get("Hash", "")
+        if returned_cid != cid:
+            duration = int((time.monotonic() - start) * 1000)
+            log.error(
+                "CID mismatch for %s: Kubo returned %s", cid, returned_cid,
+            )
+            return PinResult(
+                success=False,
+                cid=cid,
+                error=f"cid_mismatch: expected {cid}, got {returned_cid}",
+                duration_ms=duration,
+            )
+
+        bytes_pinned = int(add_data.get("Size", 0)) or None
+
+        # Step 3: Pin locally (instant since blocks are now in the blockstore)
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    self._url("pin/add"),
+                    params={"arg": cid},
+                )
+                resp.raise_for_status()
+        except Exception as exc:
+            duration = int((time.monotonic() - start) * 1000)
+            log.error("Local pin failed for %s: %s", cid, exc)
+            return PinResult(
+                success=False, cid=cid, error=f"local_pin: {exc}", duration_ms=duration,
+            )
+
+        duration = int((time.monotonic() - start) * 1000)
+        log.info("Pinned %s (%s bytes) in %dms", cid, bytes_pinned or "?", duration)
+        return PinResult(
+            success=True,
+            cid=cid,
+            bytes_pinned=bytes_pinned,
+            duration_ms=duration,
+        )
 
     async def verify_pinned(self, cid: str) -> bool:
         """Check if a CID is pinned on our local node."""

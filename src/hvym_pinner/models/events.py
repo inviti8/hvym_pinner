@@ -11,6 +11,7 @@ class PinEvent:
 
     slot_id: int
     cid: str
+    filename: str
     gateway: str
     offer_price: int  # stroops
     pin_qty: int

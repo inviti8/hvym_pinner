@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS daemon_config (
 CREATE TABLE IF NOT EXISTS offers (
     slot_id INTEGER PRIMARY KEY,
     cid TEXT NOT NULL,
+    filename TEXT NOT NULL DEFAULT '',
     gateway TEXT NOT NULL,
     offer_price INTEGER NOT NULL,
     pin_qty INTEGER NOT NULL,
@@ -260,12 +261,12 @@ class SQLiteStateStore:
         now = _now()
         await self.db.execute(
             "INSERT OR REPLACE INTO offers"
-            " (slot_id, cid, gateway, offer_price, pin_qty, pins_remaining,"
+            " (slot_id, cid, filename, gateway, offer_price, pin_qty, pins_remaining,"
             "  publisher, ledger_sequence, status, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                event.slot_id, event.cid, event.gateway, event.offer_price,
-                event.pin_qty, event.pin_qty, event.publisher,
+                event.slot_id, event.cid, event.filename, event.gateway,
+                event.offer_price, event.pin_qty, event.pin_qty, event.publisher,
                 event.ledger_sequence, status, now, now,
             ),
         )
@@ -621,6 +622,7 @@ def _row_to_offer(row: aiosqlite.Row) -> OfferRecord:
     return OfferRecord(
         slot_id=row["slot_id"],
         cid=row["cid"],
+        filename=row["filename"],
         gateway=row["gateway"],
         offer_price=row["offer_price"],
         pin_qty=row["pin_qty"],

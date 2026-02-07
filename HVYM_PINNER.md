@@ -134,7 +134,7 @@ The daemon pins and collects payment without any human interaction. As long as:
 ...the daemon pins and claims immediately. This is the "set it and forget it" mode for operators who trust their price threshold and want maximum throughput.
 
 ```
-PIN event ──▶ Filter ──▶ [passes?] ──▶ Pin content ──▶ collect_pin() ──▶ Earned
+PIN event ──▶ Filter ──▶ [passes?] ──▶ Fetch from gateway ──▶ Add+Pin to Kubo ──▶ collect_pin() ──▶ Earned
                             │
                             └──▶ [fails?] ──▶ Rejected (logged)
 ```
@@ -190,9 +190,10 @@ The mode can be changed at runtime via the data API (no restart required). The d
 │                  │  Pin Executor   │       │ Approval Queue  │       │
 │                  │                 │       │                 │       │
 │                  │ 1. Fetch from   │       │ awaiting_       │       │
-│                  │    gateway      │       │ approval offers │       │
-│                  │ 2. Pin to Kubo  │◀──────│ (frontend       │       │
-│                  │ 3. Verify pin   │approve│  approves)      │       │
+│                  │    gateway URL  │       │ approval offers │       │
+│                  │ 2. Add to Kubo  │◀──────│ (frontend       │       │
+│                  │    (verify CID) │approve│  approves)      │       │
+│                  │ 3. Pin locally  │       │                 │       │
 │                  └────────┬────────┘       └─────────────────┘       │
 │                           │                         ▲                │
 │                  ┌────────▼────────┐                │                │
@@ -212,6 +213,12 @@ The mode can be changed at runtime via the data API (no restart required). The d
          ▼                    ▼                    ▼
    Soroban Testnet       Kubo Node            Local SQLite
    (stellar-sdk)        (:5001 RPC)            (state.db)
+                             │
+                    ┌────────┴────────┐
+                    │  Publisher       │
+                    │  Gateway (HTTPS) │
+                    │  {gateway}/ipfs/ │
+                    └─────────────────┘
 ```
 
 ---
@@ -251,6 +258,7 @@ class PinEvent:
     """Emitted when a publisher creates a pin request."""
     slot_id: int
     cid: str
+    filename: str         # original filename (display metadata, does NOT affect CID)
     gateway: str
     offer_price: int      # stroops
     pin_qty: int
@@ -350,13 +358,17 @@ class DaemonMode(str, Enum):
 
 **Responsibility**: Download content from the publisher's gateway and pin it to the local Kubo node.
 
+**Critical context — Pintheon nodes are private**: Pintheon IPFS nodes run in fully isolated private swarms (`LIBP2P_FORCE_PNET=1`, private swarm key, all bootstrap peers removed). They have zero peering exposure to the public IPFS network. Content published on a Pintheon node is **not discoverable via DHT, Bitswap, or any standard IPFS resolution mechanism**. The publisher's public HTTPS gateway (served by nginx proxying to the local Kubo gateway) is the **only** way for pinners to obtain the content.
+
+This means `pin/add?arg={cid}` alone will **always timeout** for fresh Pintheon content — Kubo cannot find providers on the public DHT because the publisher never advertises there. The executor must fetch content from the gateway URL first, then inject it into the local blockstore.
+
 **Interface**:
 ```python
 class PinExecutor(Protocol):
     """Handles the actual IPFS pinning operation."""
 
     async def pin(self, cid: str, gateway: str) -> PinResult:
-        """Fetch CID from gateway and pin to local Kubo node."""
+        """Fetch content from gateway, add to local Kubo, and pin."""
         ...
 
     async def verify_pinned(self, cid: str) -> bool:
@@ -368,16 +380,56 @@ class PinExecutor(Protocol):
         ...
 ```
 
-**Implementation details**:
-- **Step 1**: Fetch content via gateway URL: `GET {gateway}/ipfs/{cid}`
+**Implementation — three-step gateway-fetch pipeline**:
+
+```
+Publisher's Pintheon Node                    Pinner's Kubo Node
+  (private IPFS swarm)                      (public IPFS node)
+         │                                          │
+         │  nginx gateway (HTTPS)                   │
+         │  GET {gateway}/ipfs/{cid}                │
+         │◀─────────────────────────────────────────│ Step 1: Fetch bytes
+         │──────────── raw content bytes ──────────▶│
+         │                                          │
+         │                                POST /api/v0/add
+         │                                (multipart upload) ──▶│ Step 2: Add to
+         │                                returned_cid == cid?  │ local blockstore
+         │                                          │           │ + verify CID match
+         │                                          │
+         │                                POST /api/v0/pin/add?arg={cid}
+         │                                (instant — blocks are local) ──▶│ Step 3: Pin
+         │                                          │
+```
+
+- **Step 1 — Fetch from gateway**: `GET {gateway}/ipfs/{cid}`
+  - The gateway URL comes from the `PinEvent`. It points to the publisher's nginx proxy which serves content from their private Kubo gateway.
   - Timeout: configurable, default 60 seconds
-  - Max size: configurable, default 1 GB
-  - Retry: up to 3 attempts with exponential backoff
-- **Step 2**: Pin to local Kubo via HTTP RPC: `POST http://localhost:5001/api/v0/pin/add?arg={cid}`
-  - If content was fetched from gateway, Kubo should already have it in its blockstore
-  - Alternative: `POST http://localhost:5001/api/v0/pin/add?arg={cid}` directly (Kubo resolves via DHT/gateway)
-- **Step 3**: Verify pin: `POST http://localhost:5001/api/v0/pin/ls?arg={cid}`
-  - Confirm the CID appears in the pinned set
+  - Max size: configurable, default 1 GB (check `Content-Length` header before downloading body)
+  - Retry: up to 3 attempts with exponential backoff on timeout/5xx
+  - Stream the response to avoid holding large files in memory
+
+- **Step 2 — Add to local Kubo**: `POST http://localhost:5001/api/v0/add`
+  - Upload the fetched bytes as a multipart form file
+  - **Must use matching Kubo add parameters** to reproduce the original CID:
+    - `wrap-with-directory=false` (Pintheon default)
+    - `chunker=size-262144` (Pintheon default)
+    - `raw-leaves=false` (Pintheon default)
+    - `cid-version=0` (Pintheon default)
+    - `hash=sha2-256` (Pintheon default)
+  - **CID verification**: Compare the CID returned by `/add` against the expected CID from the event. If they don't match, abort — the gateway served wrong content.
+  - **Note on filenames**: The `filename` field in `PinEvent` is display metadata only. With `wrap-with-directory=false`, the filename in the multipart form does not affect the resulting CID. CIDs are computed purely from content bytes + UnixFS encoding parameters.
+
+- **Step 3 — Pin**: `POST http://localhost:5001/api/v0/pin/add?arg={cid}`
+  - Now succeeds instantly because the blocks are already in the local blockstore from Step 2.
+  - Verify pin: `POST http://localhost:5001/api/v0/pin/ls?arg={cid}` — confirm the CID appears in the pinned set.
+
+**Why not just `pin/add` directly?**
+
+A bare `pin/add?arg={cid}` tells Kubo to find and fetch the content via its own resolution (DHT → Bitswap → configured gateways). This **only works** if:
+- Another pinner has already pinned the content and is advertising it on the public DHT, OR
+- The content happens to exist on a public IPFS gateway that Kubo knows about
+
+For the **first pinner** to claim a fresh pin request, neither condition is true. The gateway fetch is mandatory.
 
 **Result model**:
 ```python
@@ -468,6 +520,7 @@ CREATE TABLE daemon_config (
 CREATE TABLE offers (
     slot_id INTEGER PRIMARY KEY,
     cid TEXT NOT NULL,
+    filename TEXT NOT NULL DEFAULT '',  -- original filename (display metadata)
     gateway TEXT NOT NULL,
     offer_price INTEGER NOT NULL,
     pin_qty INTEGER NOT NULL,
@@ -1296,6 +1349,7 @@ class OfferSnapshot:
     """A PIN offer as seen by the frontend."""
     slot_id: int
     cid: str
+    filename: str             # original filename (display only)
     gateway: str
     offer_price: int              # stroops
     offer_price_xlm: str          # human-readable "0.01 XLM"
@@ -1368,7 +1422,7 @@ class OperationSnapshot:
     """An in-flight pin or claim operation."""
     slot_id: int
     cid: str
-    stage: str                    # "fetching" | "pinning" | "verifying" | "claiming"
+    stage: str                    # "fetching_gateway" | "adding_to_kubo" | "pinning" | "verifying" | "claiming"
     progress_pct: int | None      # 0-100 if known
     started_at: str
 
@@ -1465,12 +1519,14 @@ async def run(config: DaemonConfig) -> None:
 
 
 async def _execute_pin_and_claim(event: PinEvent, store, executor, submitter) -> None:
-    """Pin content then collect payment. Used by both auto mode and post-approval."""
+    """Fetch content from gateway, pin locally, then collect payment.
+    Used by both auto mode and post-approval."""
 
     store.update_offer_status(event.slot_id, 'pinning')
-    store.log_activity('pin_started', f'Pinning {event.cid}', slot_id=event.slot_id, cid=event.cid)
+    store.log_activity('pin_started', f'Fetching {event.cid} from {event.gateway}',
+                       slot_id=event.slot_id, cid=event.cid)
 
-    # Pin content
+    # Fetch from gateway → add to Kubo → pin (3-step pipeline)
     pin_result = await executor.pin(event.cid, event.gateway)
     if not pin_result.success:
         store.update_offer_status(event.slot_id, 'failed', reject_reason=pin_result.error)
@@ -1749,7 +1805,7 @@ The CLI is itself a frontend client - it queries the Data API over IPC, same as 
 ## Security Considerations
 
 1. **Keypair management**: Secret key loaded from env var (`HVYM_PINNER_SECRET`) or encrypted keyfile. Never stored in config TOML.
-2. **Gateway trust**: Content fetched from publisher gateways is untrusted. Pin by CID (content-addressed) so the content is verified by its hash regardless of source.
+2. **Gateway trust**: Content fetched from publisher gateways is untrusted. The executor must verify that the CID returned by Kubo's `/add` matches the expected CID from the event — this is the content-addressing guarantee. If the gateway serves wrong or malicious content, the CID won't match and the pin is aborted.
 3. **Kubo RPC**: Runs on localhost only. No authentication needed for local daemon.
 4. **Slot race conditions**: Multiple pinners may attempt to claim the same slot. `AlreadyClaimed` and `SlotFilled` errors are expected and handled gracefully.
 5. **Content size limits**: Configurable max size to prevent pinning enormous files that exceed storage capacity.
@@ -1847,8 +1903,8 @@ Target languages (in priority order, TBD):
 2. **Concurrent pinning**: Should the daemon process multiple PIN events in parallel?
    - Recommendation: Start sequential (simpler), add configurable concurrency in a later phase.
 
-3. **Content size discovery**: Should we check content size before pinning (HEAD request to gateway) to avoid starting a 10 GB download for a 100-stroop offer?
-   - Recommendation: Yes, add a size pre-check with configurable max size.
+3. **Content size discovery**: Since we now fetch from the gateway, check `Content-Length` header from the gateway response before downloading the body to avoid a 10 GB download for a 100-stroop offer.
+   - Recommendation: Yes, check `Content-Length` in the streaming response. Abort if it exceeds `max_content_size`.
 
 4. **Earnings withdrawal**: Should the daemon auto-manage XLM balances, or leave that to the operator?
    - Recommendation: Operator manages. Daemon just earns and reports.

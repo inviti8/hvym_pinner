@@ -84,6 +84,7 @@ class OfferSnapshot:
 
     slot_id: int
     cid: str
+    filename: str
     gateway: str
     offer_price: int  # stroops
     offer_price_xlm: str  # "0.01 XLM"
