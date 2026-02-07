@@ -1,7 +1,7 @@
 [project]
-name = "hvym-pinner"
+name = "hvym-pinwheel"
 version = "0.1.0"
-description = "Autonomous IPFS pinning daemon for the Heavymeta/Pintheon ecosystem"
+description = "Pinwheel — Autonomous IPFS pinning daemon for the Heavymeta/Pintheon ecosystem"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -21,7 +21,7 @@ dev = [
 ]
 
 [project.scripts]
-hvym-pinner = "hvym_pinner.cli:main"
+hvym-pinwheel = "hvym_pinner.cli:main"
 
 [build-system]
 requires = ["hatchling"]
