@@ -23,11 +23,6 @@ from hvym_pinner.storage.sqlite import SQLiteStateStore
 
 log = logging.getLogger(__name__)
 
-NETWORK_PASSPHRASES = {
-    "testnet": "Test SDF Network ; September 2015",
-    "mainnet": "Public Global Stellar Network ; September 2015",
-}
-
 
 class PinnerDaemon:
     """Autonomous IPFS pinning daemon.
@@ -41,7 +36,7 @@ class PinnerDaemon:
         self._running = False
         self._start_time = time.monotonic()
 
-        passphrase = cfg.network_passphrase or NETWORK_PASSPHRASES.get(cfg.network, "")
+        passphrase = cfg.network_passphrase
         keypair = Keypair.from_secret(cfg.keypair_secret)
         public_key = keypair.public_key
 

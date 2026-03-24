@@ -1,8 +1,7 @@
-"""Configuration loading: TOML file + environment variables + deployments.json."""
+"""Configuration loading: TOML file + environment variables."""
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 
@@ -18,12 +17,12 @@ def load_config(
     config_path: str | Path | None = None,
     env_prefix: str = "HVYM_PINNER_",
 ) -> DaemonConfig:
-    """Load daemon configuration from TOML file, env vars, and deployments.json.
+    """Load daemon configuration from TOML file and environment variables.
 
     Priority (highest wins):
         1. Environment variables (HVYM_PINNER_SECRET, etc.)
         2. TOML config file
-        3. Defaults from DaemonConfig
+        3. Network defaults (via DaemonConfig.set_network)
     """
     raw: dict = {}
     if config_path is not None:
@@ -46,9 +45,11 @@ def load_config(
         cfg.log_level = str(v)
 
     # ── Stellar section ────────────────────────────────────
+    # Apply network first so all dependent fields get their defaults,
+    # then overlay any explicit per-field overrides from the TOML.
     stellar = raw.get("stellar", {})
     if v := stellar.get("network"):
-        cfg.network = str(v)
+        cfg.set_network(str(v))
     if v := stellar.get("rpc_url"):
         cfg.rpc_url = str(v)
     if v := stellar.get("contract_id"):
@@ -59,11 +60,6 @@ def load_config(
         cfg.keypair_secret = str(v)
     if v := stellar.get("network_passphrase"):
         cfg.network_passphrase = str(v)
-
-    # Load contract IDs from deployments.json if not explicitly set
-    deployments_path = stellar.get("deployments_path", "../pintheon_contracts/deployments.json")
-    if not cfg.contract_id:
-        _load_deployments(cfg, deployments_path)
 
     # ── IPFS section ───────────────────────────────────────
     ipfs = raw.get("ipfs", {})
@@ -102,10 +98,12 @@ def load_config(
     )
 
     # ── Environment variable overrides (highest priority) ──
+    # Network env var triggers set_network() so all dependent fields update,
+    # then individual env vars can still override specific fields.
+    if net := os.environ.get(f"{env_prefix}NETWORK"):
+        cfg.set_network(net)
     if secret := os.environ.get(f"{env_prefix}SECRET"):
         cfg.keypair_secret = secret
-    if net := os.environ.get(f"{env_prefix}NETWORK"):
-        cfg.network = net
     if rpc := os.environ.get(f"{env_prefix}RPC_URL"):
         cfg.rpc_url = rpc
     if cid := os.environ.get(f"{env_prefix}CONTRACT_ID"):
@@ -117,24 +115,3 @@ def load_config(
     cfg.db_path = str(Path(cfg.db_path).expanduser())
 
     return cfg
-
-
-def _load_deployments(cfg: DaemonConfig, deployments_path: str) -> None:
-    """Load contract IDs from pintheon_contracts/deployments.json."""
-    p = Path(deployments_path).expanduser()
-    if not p.is_absolute():
-        # Try relative to CWD
-        p = Path.cwd() / p
-    if not p.exists():
-        return
-
-    with open(p) as f:
-        data = json.load(f)
-
-    pin_service = data.get("hvym_pin_service", {})
-    if cid := pin_service.get("contract_id"):
-        cfg.contract_id = cid
-
-    factory = data.get("hvym_pin_service_factory", {})
-    if cid := factory.get("contract_id"):
-        cfg.factory_contract_id = cid

@@ -10,7 +10,7 @@ import click
 from stellar_sdk import Keypair
 
 from hvym_pinner.config import load_config
-from hvym_pinner.daemon import run_daemon, NETWORK_PASSPHRASES
+from hvym_pinner.daemon import run_daemon
 from hvym_pinner.stellar.queries import ContractQueries, STROOPS_PER_XLM
 from hvym_pinner.storage.sqlite import SQLiteStateStore
 from hvym_pinner.bindings.hvym_pin_service import ClientAsync
@@ -32,12 +32,12 @@ def _require_contract(cfg):
     """Exit with error if no contract ID is configured."""
     if not cfg.contract_id:
         click.echo("Error: No contract ID configured.", err=True)
-        click.echo("Set HVYM_PINNER_CONTRACT_ID or check deployments.json.", err=True)
+        click.echo("Set HVYM_PINNER_CONTRACT_ID or check network setting.", err=True)
         sys.exit(1)
 
 
 def _passphrase(cfg) -> str:
-    return cfg.network_passphrase or NETWORK_PASSPHRASES.get(cfg.network, "")
+    return cfg.network_passphrase
 
 
 @click.group()
