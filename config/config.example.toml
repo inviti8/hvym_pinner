@@ -7,10 +7,9 @@ log_level = "info"
 [stellar]
 network = "testnet"
 rpc_url = "https://soroban-testnet.stellar.org"
-# Contract IDs are resolved automatically from the built-in registry based on
-# the network setting above. Override here only if using custom deployments:
-# contract_id = "CCEDYFIHUCJFITWEOT7BWUO2HBQQ72L244ZXQ4YNOC6FYRDN3MKDQFK7"
-# factory_contract_id = "CACBN6G2EPPLAQORDB3LXN3SULGVYBAETFZTNYTNDQ77B7JFRIBT66V2"
+# Contract ID is resolved dynamically from the on-chain hvym-registry contract
+# at startup. Override here only if using a custom deployment:
+# contract_id = "CDYUS4OXHGVX4AFNERP3CQAMI5JNDTPQZ6MAV3EH53NN3YYPJW2SW2FP"
 # Secret key: use HVYM_PINNER_SECRET env var instead of putting it here
 # keypair_secret = ""
 

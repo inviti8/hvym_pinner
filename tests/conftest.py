@@ -76,7 +76,6 @@ def make_test_config(**overrides) -> DaemonConfig:
         rpc_url="https://soroban-testnet.stellar.org",
         network_passphrase="Test SDF Network ; September 2015",
         contract_id="CCEDYFIHUCJFITWEOT7BWUO2HBQQ72L244ZXQ4YNOC6FYRDN3MKDQFK7",
-        factory_contract_id="CACBN6G2EPPLAQORDB3LXN3SULGVYBAETFZTNYTNDQ77B7JFRIBT66V2",
         keypair_secret=TEST_SECRET,
         kubo_rpc_url="http://127.0.0.1:5001",
         pin_timeout=5,

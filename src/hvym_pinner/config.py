@@ -54,8 +54,6 @@ def load_config(
         cfg.rpc_url = str(v)
     if v := stellar.get("contract_id"):
         cfg.contract_id = str(v)
-    if v := stellar.get("factory_contract_id"):
-        cfg.factory_contract_id = str(v)
     if v := stellar.get("keypair_secret"):
         cfg.keypair_secret = str(v)
     if v := stellar.get("network_passphrase"):

@@ -18,6 +18,7 @@ from hvym_pinner.models.events import PinEvent, PinnedEvent, UnpinEvent
 from hvym_pinner.policy.filter import PolicyOfferFilter
 from hvym_pinner.stellar.poller import SorobanEventPoller
 from hvym_pinner.stellar.queries import ContractQueries
+from hvym_pinner.stellar.registry import resolve_contracts
 from hvym_pinner.stellar.submitter import SorobanClaimSubmitter
 from hvym_pinner.storage.sqlite import SQLiteStateStore
 
@@ -322,6 +323,9 @@ class PinnerDaemon:
 
 async def run_daemon(cfg: DaemonConfig) -> None:
     """Entry point for running the daemon."""
+    # Resolve contract IDs from on-chain registry before building components
+    await resolve_contracts(cfg)
+
     daemon = PinnerDaemon(cfg)
 
     loop = asyncio.get_event_loop()

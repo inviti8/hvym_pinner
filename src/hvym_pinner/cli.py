@@ -12,6 +12,7 @@ from stellar_sdk import Keypair
 from hvym_pinner.config import load_config
 from hvym_pinner.daemon import run_daemon
 from hvym_pinner.stellar.queries import ContractQueries, STROOPS_PER_XLM
+from hvym_pinner.stellar.registry import resolve_contracts
 from hvym_pinner.storage.sqlite import SQLiteStateStore
 from hvym_pinner.bindings.hvym_pin_service import ClientAsync
 
@@ -81,15 +82,19 @@ def run(ctx: click.Context) -> None:
 def status(ctx: click.Context) -> None:
     """Show daemon configuration."""
     cfg = load_config(ctx.obj["config_path"])
-    click.echo(f"Mode:       {cfg.mode.value}")
-    click.echo(f"Network:    {cfg.network}")
-    click.echo(f"RPC URL:    {cfg.rpc_url}")
-    click.echo(f"Contract:   {cfg.contract_id or '(not set)'}")
-    click.echo(f"Factory:    {cfg.factory_contract_id or '(not set)'}")
-    click.echo(f"Kubo RPC:   {cfg.kubo_rpc_url}")
-    click.echo(f"Min price:  {cfg.min_price} stroops")
-    click.echo(f"DB path:    {cfg.db_path}")
-    click.echo(f"Secret:     {'***configured***' if cfg.keypair_secret else '(not set)'}")
+
+    async def _status():
+        await resolve_contracts(cfg)
+        click.echo(f"Mode:       {cfg.mode.value}")
+        click.echo(f"Network:    {cfg.network}")
+        click.echo(f"RPC URL:    {cfg.rpc_url}")
+        click.echo(f"Contract:   {cfg.contract_id or '(not set)'}")
+        click.echo(f"Kubo RPC:   {cfg.kubo_rpc_url}")
+        click.echo(f"Min price:  {cfg.min_price} stroops")
+        click.echo(f"DB path:    {cfg.db_path}")
+        click.echo(f"Secret:     {'***configured***' if cfg.keypair_secret else '(not set)'}")
+
+    asyncio.run(_status())
 
 
 @cli.command()
@@ -101,6 +106,7 @@ def info(ctx: click.Context) -> None:
     _require_contract(cfg)
 
     async def _info():
+        await resolve_contracts(cfg)
         keypair = Keypair.from_secret(cfg.keypair_secret)
         public_key = keypair.public_key
         queries = ContractQueries(cfg.contract_id, cfg.rpc_url, _passphrase(cfg))
@@ -164,6 +170,7 @@ def register(ctx: click.Context, node_id: str, multiaddr: str, min_price: int, y
     _require_contract(cfg)
 
     async def _register():
+        await resolve_contracts(cfg)
         keypair = Keypair.from_secret(cfg.keypair_secret)
         public_key = keypair.public_key
         passphrase = _passphrase(cfg)
@@ -244,6 +251,7 @@ def unregister(ctx: click.Context, yes: bool) -> None:
     _require_contract(cfg)
 
     async def _unregister():
+        await resolve_contracts(cfg)
         keypair = Keypair.from_secret(cfg.keypair_secret)
         public_key = keypair.public_key
         passphrase = _passphrase(cfg)
@@ -317,6 +325,7 @@ def update_pinner(
         sys.exit(1)
 
     async def _update():
+        await resolve_contracts(cfg)
         keypair = Keypair.from_secret(cfg.keypair_secret)
         public_key = keypair.public_key
         passphrase = _passphrase(cfg)
